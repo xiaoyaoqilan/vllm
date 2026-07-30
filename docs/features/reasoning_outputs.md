@@ -257,7 +257,7 @@ To use this feature:
 
 If `thinking_token_budget` is not specified, no explicit reasoning limit is applied beyond normal generation constraints such as `max_tokens`.
 
-`--reasoning-config` accepts a JSON object corresponding to  
+`--reasoning-config` accepts a JSON object corresponding to
 [ReasoningConfig][vllm.config.ReasoningConfig] with the following fields:
 
 | Field                 | Type           | Description                                      |
