@@ -1,6 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stats and Prometheus metrics for the NIXL connector."""
+"""Stats and Prometheus metrics for the NIXL connector.
+
+The NIXL KV connector records per-transfer telemetry on each TP rank
+independently.  Stats from all ranks are aggregated (concatenated) before
+summary statistics are computed.  This means:
+
+* "Num successful transfers" is the total count across all ranks, not per-rank.
+* "Avg MB per transfer" is averaged over all individual rank-level transfers,
+  not the total bytes for a single KV cache transfer operation.
+* "Throughput (MB/s)" is total_MB_all_ranks / total_time_all_ranks — an
+  average per-rank throughput rather than aggregate system throughput.
+* Percentiles (P90) are computed over the combined distribution of every
+  rank's transfer times.
+
+Users of multi-rank (TP > 1) deployments should interpret the log line with
+these semantics in mind.
+"""
 
 import copy
 from dataclasses import dataclass
@@ -23,7 +39,17 @@ if TYPE_CHECKING:
 
 @dataclass
 class NixlKVConnectorStats(KVConnectorStats):
-    """Container for transfer performance metrics"""
+    """Container for NIXL KV transfer performance metrics.
+
+    Each TP rank independently records per-transfer telemetry via
+    :meth:`record_transfer`.  The :meth:`aggregate` method concatenates
+    observations from all ranks (fire-and-forget from workers), and
+    :meth:`reduce` computes summary statistics over the combined pool.
+
+    In multi-rank (TP > 1) deployments the resulting metrics are therefore
+    **cross-rank aggregates** — they do not represent per-engine totals or
+    single-transfer characteristics.  See the module docstring for details.
+    """
 
     def __post_init__(self):
         if not self.data:
@@ -76,6 +102,14 @@ class NixlKVConnectorStats(KVConnectorStats):
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        """Concatenate observations from another rank/worker.
+
+        Stats from every TP rank are independently recorded and then
+        aggregated (via ``list.extend``) into a single combined pool before
+        :meth:`reduce` computes summary statistics.  This is a deliberate
+        "fire-and-forget" design: workers ship their raw observations and the
+        logger process merges them without per-rank accounting.
+        """
         if not other.is_empty():
             for k, v in other.data.items():
                 accumulator = self.data[k]
@@ -84,7 +118,20 @@ class NixlKVConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        # Compute compact representative stats suitable for CLI logging
+        """Compute summary statistics over the **combined** observation pool.
+
+        The returned dict is intended for CLI logging.  Important semantics
+        when interpreting the values in a multi-rank deployment:
+
+        * ``Num successful transfers`` — total count across all TP ranks.
+        * ``Avg MB per transfer`` — mean over every rank-level transfer
+          (not the total MB for one logical KV-cache move).
+        * ``Throughput (MB/s)`` — total_MB / total_time across all ranks,
+          which represents an average per-rank throughput rather than
+          aggregate system throughput.
+        * ``Avg/P90 xfer time`` — computed from the combined distribution of
+          all ranks' individual transfer durations.
+        """
         if self.num_successful_transfers == 0:
             # CLI logging only reports successful transfers stats. If all requests in
             # the interval were unsuccessful, Prom will report failures stats instead.
@@ -110,6 +157,9 @@ class NixlKVConnectorStats(KVConnectorStats):
         total_mb = mb.sum()
         avg_mb = total_mb / n
 
+        # Throughput is total MB across all ranks divided by total transfer
+        # time — i.e. an average per-rank throughput, not aggregate system
+        # throughput.
         total_time_seconds = xfer_time.sum()
         throughput_mb_s = total_mb / total_time_seconds
 
