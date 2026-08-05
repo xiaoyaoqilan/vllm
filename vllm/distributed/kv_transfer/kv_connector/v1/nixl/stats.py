@@ -1,6 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stats and Prometheus metrics for the NIXL connector."""
+"""Stats and Prometheus metrics for the NIXL connector.
+
+The NIXL KV connector records per-transfer telemetry on each TP rank
+independently.  Stats from all ranks are aggregated (concatenated) before
+summary statistics are computed.  This means:
+
+* "Num successful transfers" is the total count across all ranks, not per-rank.
+* "Avg MB per transfer" is averaged over all individual rank-level transfers,
+  not the total bytes for a single KV cache transfer operation.
+* "Throughput (MB/s)" is total_MB_all_ranks / total_time_all_ranks — an
+  average per-rank throughput rather than aggregate system throughput.
+* Percentiles (P90) are computed over the combined distribution of every
+  rank's transfer times.
+
+Users of multi-rank (TP > 1) deployments should interpret the log line with
+these semantics in mind.
+"""
 
 import copy
 from dataclasses import dataclass
@@ -23,15 +39,23 @@ if TYPE_CHECKING:
 
 @dataclass
 class NixlKVConnectorStats(KVConnectorStats):
-    """Container for transfer performance metrics"""
+    """Container for NIXL KV transfer performance metrics.
+
+    Each TP rank independently records per-transfer telemetry via
+    :meth:`record_transfer`.  The :meth:`aggregate` method concatenates
+    observations from all ranks (fire-and-forget from workers), and
+    :meth:`reduce` computes summary statistics over the combined pool.
+
+    In multi-rank (TP > 1) deployments the resulting metrics are therefore
+    **cross-rank aggregates** — they do not represent per-engine totals or
+    single-transfer characteristics.  See the module docstring for details.
+    """
 
     def __post_init__(self):
         if not self.data:
-            # Empty container init, no data is passed in.
             self.reset()
 
     def reset(self):
-        # Must be serializable
         self.data: dict[str, list[float | int]] = {
             "transfer_duration": [],
             "post_duration": [],
@@ -43,7 +67,6 @@ class NixlKVConnectorStats(KVConnectorStats):
         }
 
     def record_transfer(self, res: "nixlXferTelemetry"):
-        # Keep metrics units consistent with rest of the code: time us->s
         self.data["transfer_duration"].append(res.xferDuration / 1e6)
         self.data["post_duration"].append(res.postDuration / 1e6)
         self.data["bytes_transferred"].append(res.totalBytes)
@@ -67,7 +90,6 @@ class NixlKVConnectorStats(KVConnectorStats):
         return old
 
     def is_empty(self) -> bool:
-        # Do not discard metrics update that are entirely failures related.
         return (
             self.num_successful_transfers == 0
             and len(self.data["num_failed_transfers"]) == 0
@@ -76,6 +98,14 @@ class NixlKVConnectorStats(KVConnectorStats):
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        """Concatenate observations from another rank/worker.
+
+        Stats from every TP rank are independently recorded and then
+        aggregated (via ``list.extend``) into a single combined pool before
+        :meth:`reduce` computes summary statistics.  This is a deliberate
+        "fire-and-forget" design: workers ship their raw observations and the
+        logger process merges them without per-rank accounting.
+        """
         if not other.is_empty():
             for k, v in other.data.items():
                 accumulator = self.data[k]
@@ -84,10 +114,21 @@ class NixlKVConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        # Compute compact representative stats suitable for CLI logging
+        """Compute summary statistics over the **combined** observation pool.
+
+        The returned dict is intended for CLI logging.  Important semantics
+        when interpreting the values in a multi-rank deployment:
+
+        * ``Num successful transfers`` — total count across all TP ranks.
+        * ``Avg MB per transfer`` — mean over every rank-level transfer
+          (not the total MB for one logical KV-cache move).
+        * ``Throughput (MB/s)`` — total_MB / total_time across all ranks,
+          which represents an average per-rank throughput rather than
+          aggregate system throughput.
+        * ``Avg/P90 xfer time`` — computed from the combined distribution of
+          all ranks' individual transfer durations.
+        """
         if self.num_successful_transfers == 0:
-            # CLI logging only reports successful transfers stats. If all requests in
-            # the interval were unsuccessful, Prom will report failures stats instead.
             return {
                 "Num successful transfers": 0,
                 "Avg xfer time (ms)": 0,
@@ -101,7 +142,6 @@ class NixlKVConnectorStats(KVConnectorStats):
 
         xfer_time = np.asarray(self.data["transfer_duration"])
         post_time = np.asarray(self.data["post_duration"])
-        # Convert to MB for CLI logging.
         mb = np.asarray(self.data["bytes_transferred"]) / 2**20
         descs = np.asarray(self.data["num_descriptors"], dtype=np.uint32)
         n = len(descs)
@@ -110,6 +150,9 @@ class NixlKVConnectorStats(KVConnectorStats):
         total_mb = mb.sum()
         avg_mb = total_mb / n
 
+        # Throughput is total MB across all ranks divided by total transfer
+        # time — i.e. an average per-rank throughput, not aggregate system
+        # throughput.
         total_time_seconds = xfer_time.sum()
         throughput_mb_s = total_mb / total_time_seconds
 
@@ -140,19 +183,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
         buckets = [
-            0.001,
-            0.005,
-            0.01,
-            0.025,
-            0.05,
-            0.075,
-            0.1,
-            0.2,
-            0.3,
-            0.5,
-            0.75,
-            1.0,
-            5.0,
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 5.0,
         ]
         nixl_histogram_xfer_time = self._histogram_cls(
             name="vllm:nixl_xfer_time_seconds",
@@ -165,15 +196,13 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
         nixl_histogram_post_time = self._histogram_cls(
             name="vllm:nixl_post_time_seconds",
-            documentation="Histogram of transfer post time for NIXL KV"
-            " Cache transfers.",
+            documentation="Histogram of transfer post time for NIXL KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
         self.nixl_histogram_post_time = create_metric_per_engine(
             nixl_histogram_post_time, self.per_engine_labelvalues
         )
-        # uniform 2kb to 16gb range
         buckets = [2 ** (10 + i) for i in range(1, 25, 2)]
         nixl_histogram_bytes_transferred = self._histogram_cls(
             name="vllm:nixl_bytes_transferred",
@@ -184,26 +213,10 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         self.nixl_histogram_bytes_transferred = create_metric_per_engine(
             nixl_histogram_bytes_transferred, self.per_engine_labelvalues
         )
-        buckets = [
-            10,
-            20,
-            30,
-            50,
-            75,
-            100,
-            200,
-            400,
-            1000,
-            2000,
-            4000,
-            10000,
-            20000,
-            50000,
-        ]
+        buckets = [10, 20, 30, 50, 75, 100, 200, 400, 1000, 2000, 4000, 10000, 20000, 50000]
         nixl_histogram_num_descriptors = self._histogram_cls(
             name="vllm:nixl_num_descriptors",
-            documentation="Histogram of number of descriptors per NIXL"
-            "  KV Cache transfers.",
+            documentation="Histogram of number of descriptors per NIXL KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -226,7 +239,6 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         self.counter_nixl_num_failed_notifications = create_metric_per_engine(
             counter_nixl_num_failed_notifications, self.per_engine_labelvalues
         )
-
         counter_nixl_num_kv_expired_reqs = self._counter_cls(
             name="vllm:nixl_num_kv_expired_reqs",
             documentation="Number of requests that had their KV expire. "
@@ -239,27 +251,15 @@ class NixlPromMetrics(KVConnectorPromMetrics):
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         for prom_obj, list_item_key in zip(
-            [
-                self.nixl_histogram_xfer_time,
-                self.nixl_histogram_post_time,
-                self.nixl_histogram_bytes_transferred,
-                self.nixl_histogram_num_descriptors,
-            ],
-            [
-                "transfer_duration",
-                "post_duration",
-                "bytes_transferred",
-                "num_descriptors",
-            ],
+            [self.nixl_histogram_xfer_time, self.nixl_histogram_post_time,
+             self.nixl_histogram_bytes_transferred, self.nixl_histogram_num_descriptors],
+            ["transfer_duration", "post_duration", "bytes_transferred", "num_descriptors"],
         ):
             for list_item in transfer_stats_data[list_item_key]:
                 prom_obj[engine_idx].observe(list_item)
         for counter_obj, counter_item_key in zip(
-            [
-                self.counter_nixl_num_failed_transfers,
-                self.counter_nixl_num_failed_notifications,
-                self.counter_nixl_num_kv_expired_reqs,
-            ],
+            [self.counter_nixl_num_failed_transfers, self.counter_nixl_num_failed_notifications,
+             self.counter_nixl_num_kv_expired_reqs],
             ["num_failed_transfers", "num_failed_notifications", "num_kv_expired_reqs"],
         ):
             for list_item in transfer_stats_data[counter_item_key]:
